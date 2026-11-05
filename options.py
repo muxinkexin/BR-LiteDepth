@@ -10,6 +10,15 @@ class LiteMonoOptions:
     def __init__(self):
         self.parser = argparse.ArgumentParser(description="Lite-Mono options")
 
+        self.parser.add_argument('--seed',type=int,default=0)
+        self.parser.add_argument('--resolution_aug',choices=['none','pad3','repeat3'],default='none')
+        self.parser.add_argument('--consistency',choices=['none','ra','log','band'],default='none')
+        self.parser.add_argument('--lambda_cs',type=float,default=1.0)
+        self.parser.add_argument('--lambda_band',type=float,default=0.2)
+        self.parser.add_argument('--consistency_start_epoch',type=int,default=5)
+        self.parser.add_argument('--consistency_ramp_epochs',type=int,default=5)
+        self.parser.add_argument('--conditional_cdc',action='store_true')
+
         # PATHS
         self.parser.add_argument("--data_path",
                                  type=str,
@@ -111,7 +120,7 @@ class LiteMonoOptions:
         self.parser.add_argument("--num_epochs",
                                  type=int,
                                  help="number of epochs",
-                                 default=50)
+                                 default=30)
         self.parser.add_argument("--scheduler_step_size",
                                  type=int,
                                  help="step size of the scheduler",

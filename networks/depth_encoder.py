@@ -174,6 +174,47 @@ class CDilated(nn.Module):
         return output
 
 
+class BRConditionalDepthwise(nn.Module):
+    """Preserve the existing .conv state_dict keys and share one kernel."""
+    def __init__(self, old, reference_focal):
+        super().__init__()
+        self.conv = old.conv
+        c = self.conv.in_channels
+        self.gate = nn.Sequential(nn.Linear(c+4,16),nn.GELU(),nn.Linear(16,c))
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias,-2.0)
+        self.register_buffer('reference_focal',torch.tensor(reference_focal,dtype=torch.float32))
+
+    def forward(self,x,camera):
+        if camera is None:
+            raise ValueError('conditional CDC requires current input K')
+        k, image_hw = camera
+        k = k.to(device=x.device,dtype=x.dtype)
+        b,c,h,w = x.shape
+        ih, iw = image_hw
+        ratio = torch.stack([k[:,0,0],k[:,1,1]],1)/self.reference_focal.to(x.dtype)
+        r = self.conv.dilation[0]
+        d = (r*ratio).clamp(0.5,8.0)
+        q = torch.cat([ratio.log(),(k[:,0,2]/iw-0.5)[:,None],
+                        (k[:,1,2]/ih-0.5)[:,None]],1)
+        g = torch.sigmoid(self.gate(torch.cat([x.mean((2,3)),q],1)))[:,:,None,None]
+        yy,xx = torch.meshgrid(torch.arange(h,device=x.device,dtype=x.dtype),
+                               torch.arange(w,device=x.device,dtype=x.dtype),indexing='ij')
+        adaptive = torch.zeros_like(x)
+        for ky in range(-1,2):
+            for kx in range(-1,2):
+                px = xx[None]+d[:,0,None,None]*kx
+                py = yy[None]+d[:,1,None,None]*ky
+                grid = torch.stack([2*px/max(w-1,1)-1,2*py/max(h-1,1)-1],-1)
+                sample = F.grid_sample(x,grid,mode='bilinear',padding_mode='zeros',align_corners=True)
+                weight = self.conv.weight[:,0,ky+1,kx+1][None,:,None,None]
+                adaptive = adaptive + sample*weight
+        if self.conv.bias is not None:
+            adaptive = adaptive + self.conv.bias[None,:,None,None]
+        fixed = self.conv(x)
+        return fixed + g*(adaptive-fixed)
+
+
 class DilatedConv(nn.Module):
     """
     A single Dilated Convolution layer in the Consecutive Dilated Convolutions (CDC) module.
@@ -202,10 +243,10 @@ class DilatedConv(nn.Module):
                                   requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, camera=None):
         input = x
 
-        x = self.ddwconv(x)
+        x = self.ddwconv(x,camera) if isinstance(self.ddwconv,BRConditionalDepthwise) else self.ddwconv(x)
         x = self.bn1(x)
 
         x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
@@ -298,7 +339,7 @@ class LiteMono(nn.Module):
     def __init__(self, in_chans=3, model='lite-mono', height=192, width=640,
                  global_block=[1, 1, 1], global_block_type=['LGFI', 'LGFI', 'LGFI'],
                  drop_path_rate=0.2, layer_scale_init_value=1e-6, expan_ratio=6,
-                 heads=[8, 8, 8], use_pos_embd_xca=[True, False, False], **kwargs):
+                 heads=[8, 8, 8], use_pos_embd_xca=[True, False, False], conditional_cdc=False, **kwargs):
 
         super().__init__()
 
@@ -389,6 +430,13 @@ class LiteMono(nn.Module):
             cur += self.depth[i]
 
         self.apply(self._init_weights)
+        self.conditional_cdc = conditional_cdc
+        if conditional_cdc:
+            assert model == 'lite-mono-tiny' and height == 192 and width == 640
+            with torch.random.fork_rng(devices=[]):
+                for i,j in [(1,2),(2,5)]:
+                    old = self.stages[i][j].ddwconv
+                    self.stages[i][j].ddwconv = BRConditionalDepthwise(old,(0.58*width,1.92*height))
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -402,7 +450,13 @@ class LiteMono(nn.Module):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
 
-    def forward_features(self, x):
+    def _run_stage(self, index, x, camera):
+        for block in self.stages[index]:
+            x = block(x,camera) if isinstance(block,DilatedConv) else block(x)
+        return x
+
+    def forward_features(self, x, camera=None):
+        camera = (camera,x.shape[-2:]) if camera is not None else None
         features = []
         x = (x - 0.45) / 0.225
 
@@ -415,9 +469,7 @@ class LiteMono(nn.Module):
         x = self.stem2(torch.cat((x, x_down[0]), dim=1))
         tmp_x.append(x)
 
-        for s in range(len(self.stages[0])-1):
-            x = self.stages[0][s](x)
-        x = self.stages[0][-1](x)
+        x = self._run_stage(0,x,camera)
         tmp_x.append(x)
         features.append(x)
 
@@ -427,16 +479,14 @@ class LiteMono(nn.Module):
             x = self.downsample_layers[i](x)
 
             tmp_x = [x]
-            for s in range(len(self.stages[i]) - 1):
-                x = self.stages[i][s](x)
-            x = self.stages[i][-1](x)
+            x = self._run_stage(i,x,camera)
             tmp_x.append(x)
 
             features.append(x)
 
         return features
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, camera=None):
+        x = self.forward_features(x,camera=camera)
 
         return x

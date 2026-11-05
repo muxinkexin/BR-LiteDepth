@@ -31,6 +31,14 @@ def time_sync():
 class Trainer:
     def __init__(self, options):
         self.opt = options
+        if self.opt.resolution_aug != 'none' or self.opt.conditional_cdc:
+            assert self.opt.dataset == 'kitti'
+            assert self.opt.pose_model_type == 'separate_resnet' and self.opt.pose_model_input == 'pairs'
+            assert self.opt.frame_ids == [0,-1,1] and self.opt.scales == [0,1,2]
+            assert not self.opt.use_stereo and not self.opt.v1_multiscale
+            assert not self.opt.avg_reprojection and not self.opt.predictive_mask
+        assert self.opt.consistency == 'none' or self.opt.resolution_aug != 'none'
+
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
         # checking height and width are multiples of 32
@@ -59,7 +67,8 @@ class Trainer:
 
         self.models["encoder"] = networks.LiteMono(model=self.opt.model,
                                                    drop_path_rate=self.opt.drop_path,
-                                                   width=self.opt.width, height=self.opt.height)
+                                                   width=self.opt.width, height=self.opt.height,
+                                                   conditional_cdc=self.opt.conditional_cdc)
 
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
@@ -159,6 +168,7 @@ class Trainer:
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+        train_dataset.resolution_aug = self.opt.resolution_aug
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
@@ -202,13 +212,13 @@ class Trainer:
     def set_train(self):
         """Convert all models to training mode
         """
-        for m in self.models.values():
+        for m in list(self.models.values()) + list(self.models_pose.values()):
             m.train()
 
     def set_eval(self):
         """Convert all models to testing/evaluation mode
         """
-        for m in self.models.values():
+        for m in list(self.models.values()) + list(self.models_pose.values()):
             m.eval()
 
     def train(self):
@@ -270,6 +280,9 @@ class Trainer:
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
 
+        if ('br_valid','M',0) in inputs:
+            return self.process_resolution_batch(inputs)
+
         if self.opt.pose_model_type == "shared":
             # If we are using a shared encoder for both depth and pose (as advocated
             # in monodepthv1), then all images are fed separately through the depth encoder.
@@ -285,7 +298,7 @@ class Trainer:
         else:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
 
-            features = self.models["encoder"](inputs["color_aug", 0, 0])
+            features = self.models["encoder"](inputs["color_aug", 0, 0],camera=inputs[('K',0)])
 
             outputs = self.models["depth"](features)
 
@@ -641,6 +654,10 @@ class Trainer:
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
                 to_save['use_stereo'] = self.opt.use_stereo
+                to_save['model_name'] = self.opt.model
+                to_save['conditional_cdc'] = self.opt.conditional_cdc
+                to_save['min_depth'] = self.opt.min_depth
+                to_save['max_depth'] = self.opt.max_depth
             torch.save(to_save, save_path)
 
         for model_name, model in self.models_pose.items():
@@ -704,3 +721,89 @@ class Trainer:
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
 
+    def process_resolution_batch(self, inputs):
+        # M keeps original keys, so the original TensorBoard/depth monitoring works.
+        views = {'M': inputs}
+        for name in ('L', 'H'):
+            v = {}
+            for s in range(4):
+                v[('K',s)] = inputs[('br_K',name,s)]
+                v[('inv_K',s)] = inputs[('br_inv_K',name,s)]
+                for fid in self.opt.frame_ids:
+                    v[('color',fid,s)] = inputs[('br_color',name,fid,s)]
+                    v[('color_aug',fid,s)] = inputs[('br_color_aug',name,fid,s)]
+            views[name] = v
+        poses = self.predict_poses(inputs, None)
+        predictions, losses, native = {}, {}, []
+        for name in ('M','L','H'):
+            v = views[name]
+            feat = self.models['encoder'](v[('color_aug',0,0)],camera=v[('K',0)])
+            out = self.models['depth'](feat)
+            out.update(poses)
+            self.generate_images_pred(v,out)
+            value = self.compute_resolution_native(v,out,inputs[('br_valid',name,0)])
+            predictions[name] = out
+            native.append(value)
+            losses['br/native_'+name] = value
+            losses['br/photo_valid_'+name] = torch.stack([out['br_valid_fraction/{}'.format(s)] for s in self.opt.scales]).mean()
+        loss = sum(native)/len(native)
+        consistency = loss*0.0
+        if self.opt.consistency != 'none':
+            pairs, coverage = [], []
+            for a,b in [('L','M'),('M','H')]:
+                x, fraction = br_cross_scale(
+                    predictions[a][('depth',0,0)], predictions[b][('depth',0,0)],
+                    views[a][('K',0)],views[b][('K',0)],
+                    inputs[('br_valid',a,0)],inputs[('br_valid',b,0)],self.opt.consistency)
+                pairs.append(x); coverage.append(fraction)
+            consistency = sum(pairs)/len(pairs)
+            losses['br/common_valid'] = sum(coverage)/len(coverage)
+        ramp = min(max((self.epoch-self.opt.consistency_start_epoch+1)
+                       /max(self.opt.consistency_ramp_epochs,1),0.0),1.0)
+        weight = self.opt.lambda_cs if self.opt.consistency == 'ra' else self.opt.lambda_band
+        losses['br/consistency'] = consistency
+        losses['br/weight'] = loss.new_tensor(ramp*weight)
+        losses['loss'] = loss + ramp*weight*consistency
+        return predictions['M'], losses
+
+    def compute_resolution_native(self, inputs, outputs, valid):
+        # Same minimum identity/reprojection strategy as original, now masked.
+        total = valid.sum()*0.0
+        for scale in self.opt.scales:
+            target = inputs[('color',0,0)]
+            depth = outputs[('depth',0,scale)]
+            points = self.backproject_depth[0](depth,inputs[('inv_K',0)])
+            errors, identities, masks = [], [], []
+            for fid in self.opt.frame_ids[1:]:
+                grid = outputs[('sample',fid,scale)]
+                source_valid = F.grid_sample(valid,grid,mode='bilinear',
+                                             padding_mode='zeros',align_corners=True)
+                in_bounds = (grid.abs() <= 1.0).all(-1).unsqueeze(1)
+                z = (outputs[('cam_T_cam',0,fid)] @ points)[:,2:3]
+                z = z.reshape_as(valid)
+                mask = ((source_valid>0.9999) & (valid>0.5) & in_bounds & (z>1e-6)).float()
+                mask = br_erode(mask,1)
+                error = self.compute_reprojection_loss(outputs[('color',fid,scale)],target)
+                identity = self.compute_reprojection_loss(inputs[('color',fid,0)],target)
+                errors.append(error.masked_fill(mask<0.5,1e3))
+                identities.append(identity.masked_fill(mask<0.5,1e3))
+                masks.append(mask)
+            valid_any = torch.stack(masks,0).amax(0)
+            photo = torch.cat(errors,1)
+            if not self.opt.disable_automasking:
+                identity = torch.cat(identities,1)
+                identity = identity + torch.randn_like(identity)*1e-5
+                combined = torch.cat([identity,photo],1)
+                values, indices = combined.min(1,keepdim=True)
+                outputs['identity_selection/{}'.format(scale)] = (
+                    (indices[:,0]>=len(errors)).float()*valid_any[:,0])
+            else:
+                values = photo.min(1,keepdim=True).values
+            photo_loss = br_masked_mean(values,valid_any)
+            disp = outputs[('disp',scale)]
+            mask_small = F.interpolate(valid,size=disp.shape[-2:],mode='nearest')
+            mask_small = br_erode(mask_small,1)
+            smooth = br_smooth_loss(disp,inputs[('color',0,scale)],mask_small)
+            total = total + photo_loss + self.opt.disparity_smoothness*smooth/(2**scale)
+            outputs['br_valid_fraction/{}'.format(scale)] = valid_any.mean().detach()
+        return total/len(self.opt.scales)

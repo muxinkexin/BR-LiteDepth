@@ -21,5 +21,14 @@ if __name__ == "__main__":
     from trainer import Trainer
 
     opts = LiteMonoOptions().parse()
+    import random
+    import numpy as np
+    import torch
+    random.seed(opts.seed)
+    np.random.seed(opts.seed)
+    torch.manual_seed(opts.seed)
+    torch.cuda.manual_seed_all(opts.seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     trainer = Trainer(opts)
     trainer.train()

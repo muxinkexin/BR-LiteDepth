@@ -51,6 +51,7 @@ class MonoDataset(data.Dataset):
         self.frame_idxs = frame_idxs
 
         self.is_train = is_train
+        self.resolution_aug = 'none' 
         self.img_ext = img_ext
 
         self.loader = pil_loader
@@ -86,6 +87,7 @@ class MonoDataset(data.Dataset):
         images in this item. This ensures that all images input to the pose network receive the
         same augmentation.
         """
+        native = {fid: inputs[('color',fid,-1)] for fid in self.frame_idxs}
         for k in list(inputs):
             frame = inputs[k]
             if "color" in k:
@@ -99,6 +101,9 @@ class MonoDataset(data.Dataset):
                 n, im, i = k
                 inputs[(n, im, i)] = self.to_tensor(f)
                 inputs[(n + "_aug", im, i)] = self.to_tensor(color_aug(f))
+
+        if self.is_train and self.resolution_aug != 'none':
+            self._build_resolution_views(inputs,native,color_aug)
 
     def __len__(self):
         return len(self.filenames)
@@ -201,3 +206,53 @@ class MonoDataset(data.Dataset):
 
     def get_depth(self, folder, frame_index, side, do_flip):
         raise NotImplementedError
+
+    def _build_resolution_views(self, inputs, native, color_aug):
+        """Flat tensor dictionary: original keys remain the M-view interface."""
+        h, w = self.height, self.width
+        mode = self.resolution_aug
+        inputs[('br_valid', 'M', 0)] = torch.ones(1,h,w)
+        if mode == 'repeat3':
+            specs = [('L',h,w,0,0),('H',h,w,0,0)]
+        else:
+            sl, sh = random.uniform(0.7,0.9), random.uniform(1.1,2.0)
+            hl, wl = int(h*sl), int(w*sl)
+            hh, wh = int(h*sh), int(w*sh)
+            specs = [('L',hl,wl,0,0),
+                     ('H',hh,wh,random.randint(0,wh-w),random.randint(0,hh-h))]
+        for name, rh, rw, crop_x, crop_y in specs:
+            mask = torch.zeros(1,h,w)
+            mask[:, :min(rh,h), :min(rw,w)] = 1.0
+            if name == 'H' or mode == 'repeat3':
+                mask.fill_(1.0)
+            inputs[('br_valid',name,0)] = mask
+            sx, sy = rw/w, rh/h
+            a = torch.eye(4,dtype=torch.float32)
+            a[0,0], a[1,1] = sx, sy
+            a[0,2] = (sx-1)/2-crop_x
+            a[1,2] = (sy-1)/2-crop_y
+            k0 = a @ inputs[('K',0)]
+            for scale in range(self.num_scales):
+                ds = 2**scale
+                down = torch.eye(4)
+                down[0,0] = down[1,1] = 1/ds
+                down[0,2] = down[1,2] = (1/ds-1)/2
+                kv = down @ k0
+                inputs[('br_K',name,scale)] = kv
+                inputs[('br_inv_K',name,scale)] = torch.linalg.inv(kv)
+            for fid in self.frame_idxs:
+                if mode == 'repeat3':
+                    for scale in range(self.num_scales):
+                        inputs[('br_color',name,fid,scale)] = inputs[('color',fid,scale)]
+                        inputs[('br_color_aug',name,fid,scale)] = inputs[('color_aug',fid,scale)]
+                    continue
+                resized = native[fid].resize((rw,rh),resample=self.interp)
+                if name == 'L':
+                    image = Image.new('RGB',(w,h))
+                    image.paste(resized,(0,0))
+                else:
+                    image = resized.crop((crop_x,crop_y,crop_x+w,crop_y+h))
+                for scale in range(self.num_scales):
+                    im = image if scale == 0 else self.resize[scale](image)
+                    inputs[('br_color',name,fid,scale)] = self.to_tensor(im)
+                    inputs[('br_color_aug',name,fid,scale)] = self.to_tensor(color_aug(im))

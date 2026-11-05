@@ -297,4 +297,110 @@ def compute_depth_errors(gt, pred):
 
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
+# BR-LiteDepth: tensor-only helpers; no new package/directory is required.
+def br_masked_mean(x, mask):
+    mask = mask.to(x.dtype)
+    return (x * mask).sum() / mask.sum().clamp_min(1.0)
 
+
+def br_erode(mask, radius=1):
+    if radius == 0:
+        return mask
+    invalid = F.pad(1.0 - mask, (radius,) * 4, value=1.0)
+    return 1.0 - F.max_pool2d(invalid, 2 * radius + 1, stride=1)
+
+
+def br_smooth_loss(disp, image, mask):
+    mean = (disp * mask).sum((2, 3), keepdim=True)
+    mean = mean / mask.sum((2, 3), keepdim=True).clamp_min(1.0)
+    d = disp / (mean + 1e-7)
+    dx = (d[..., 1:] - d[..., :-1]).abs()
+    dy = (d[..., 1:, :] - d[..., :-1, :]).abs()
+    ix = (image[..., 1:] - image[..., :-1]).abs().mean(1, True)
+    iy = (image[..., 1:, :] - image[..., :-1, :]).abs().mean(1, True)
+    mx = mask[..., 1:] * mask[..., :-1]
+    my = mask[..., 1:, :] * mask[..., :-1, :]
+    return br_masked_mean(dx * torch.exp(-ix), mx) + br_masked_mean(dy * torch.exp(-iy), my)
+
+
+def br_gaussian(x, sigma_x, sigma_y):
+    # sigma is determined by known image geometry, not learned.
+    for axis, sigma in [('x', sigma_x), ('y', sigma_y)]:
+        if sigma < 1e-5:
+            continue
+        radius = int(math.ceil(3.0 * sigma))
+        t = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+        w = torch.exp(-0.5 * (t / sigma).square())
+        w = w / w.sum()
+        kernel = w.view(1, 1, 1, -1) if axis == 'x' else w.view(1, 1, -1, 1)
+        pad = (0, radius) if axis == 'x' else (radius, 0)
+        x = F.conv2d(x, kernel, padding=pad)
+    return x
+
+
+def br_cross_scale(za, zb, ka, kb, ma, mb, mode):
+    """Return loss and common-grid valid fraction for a batch.
+
+    mode=ra: fine common grid, unfiltered SSIM+L1 depth control.
+    mode=log: coarse common grid, unfiltered log-depth control.
+    mode=band: SAME coarse grid/log loss as log, with Gaussian prefilter.
+    """
+    assert mode in ('ra', 'log', 'band')
+    assert za.shape == zb.shape and za.shape[1] == 1
+    losses, fractions = [], []
+    h, w = za.shape[-2:]
+    for n in range(za.shape[0]):
+        aa, bb = za[n:n+1], zb[n:n+1]
+        va, vb = ma[n:n+1], mb[n:n+1]
+        ca, cb = ka[n, :3, :3], kb[n, :3, :3]
+        fxa, fya, cxa, cya = [float(ca[i, j]) for i, j in [(0,0),(1,1),(0,2),(1,2)]]
+        fxb, fyb, cxb, cyb = [float(cb[i, j]) for i, j in [(0,0),(1,1),(0,2),(1,2)]]
+        assert min(fxa, fya, fxb, fyb) > 0
+        choose = max if mode == 'ra' else min
+        fx, fy = choose(fxa, fxb), choose(fya, fyb)
+        # Find rectangular real-image support, before filtering.
+        boxes = []
+        for vm, fxx, fyy, cx, cy in [(va,fxa,fya,cxa,cya),(vb,fxb,fyb,cxb,cyb)]:
+            yy, xx = torch.where(vm[0,0] > 0.5)
+            if xx.numel() == 0:
+                raise RuntimeError('BR consistency: empty real-image support')
+            boxes.append(((float(xx.min())-cx)/fxx, (float(xx.max())-cx)/fxx,
+                          (float(yy.min())-cy)/fyy, (float(yy.max())-cy)/fyy))
+        left, right = max(b[0] for b in boxes), min(b[1] for b in boxes)
+        top, bottom = max(b[2] for b in boxes), min(b[3] for b in boxes)
+        nx = int(math.floor((right-left)*fx)) + 1
+        ny = int(math.floor((bottom-top)*fy)) + 1
+        if min(nx, ny) < 4:
+            raise RuntimeError('BR consistency: insufficient overlapping field of view')
+        xs = left + torch.arange(nx,device=za.device,dtype=za.dtype)/fx
+        ys = top + torch.arange(ny,device=za.device,dtype=za.dtype)/fy
+        yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+
+        samples, supports = [], []
+        for depth, valid, fxx, fyy, cx, cy in [(aa,va,fxa,fya,cxa,cya),(bb,vb,fxb,fyb,cxb,cyb)]:
+            if mode in ('log','band'):
+                sx = 0.5 * math.sqrt(max((fxx/fx)**2-1.0, 0.0))
+                sy = 0.5 * math.sqrt(max((fyy/fy)**2-1.0, 0.0))
+                weight = br_gaussian(valid, sx, sy)
+                if mode == 'band':
+                    depth = br_gaussian(depth*valid, sx, sy) / weight.clamp_min(1e-6)
+                # log/band compare exactly the same conservative support.
+                valid = (weight > 0.9999).to(depth.dtype)
+            grid = torch.stack((2*(xx*fxx+cx)/(w-1)-1,
+                                2*(yy*fyy+cy)/(h-1)-1), -1)[None]
+            samples.append(F.grid_sample(depth,grid,mode='bilinear',padding_mode='zeros',align_corners=True))
+            supports.append(F.grid_sample(valid,grid,mode='bilinear',padding_mode='zeros',align_corners=True))
+        mask = ((supports[0] > 0.9999) & (supports[1] > 0.9999)).to(za.dtype)
+        # Same erosion for all modes; SSIM has a 3x3 support.
+        mask = br_erode(mask, 1)
+        if float(mask.sum()) < 4:
+            raise RuntimeError('BR consistency: no reliable common pixels')
+        a, b = samples
+        if mode == 'ra':
+            error = 0.85 * SSIM()(a,b) + 0.15 * (a-b).abs()
+        else:
+            delta = a.clamp_min(1e-6).log() - b.clamp_min(1e-6).log()
+            error = torch.sqrt(delta.square()+1e-6)
+        losses.append(br_masked_mean(error,mask))
+        fractions.append(mask.mean().detach())
+    return torch.stack(losses).mean(), torch.stack(fractions).mean()
